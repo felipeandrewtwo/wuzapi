@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"mime"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -28,6 +29,7 @@ import (
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
+	"golang.org/x/net/proxy"
 )
 
 // db field declaration as *sqlx.DB
@@ -412,7 +414,28 @@ func (s *server) startClient(userID string, textjid string, token string, subscr
 	var proxyURL string
 	err = s.db.Get(&proxyURL, "SELECT proxy_url FROM users WHERE id=$1", userID)
 	if err == nil && proxyURL != "" {
-		httpClient.SetProxy(proxyURL)
+
+		parsed, perr := url.Parse(proxyURL)
+		if perr != nil {
+			log.Warn().Err(perr).Str("proxy", proxyURL).Msg("Invalid proxy URL, skipping proxy setup")
+		} else {
+			if parsed.Scheme == "socks5" || parsed.Scheme == "socks5h" {
+				// Build SOCKS dialer from URL (supports user:pass in URL)
+				dialer, derr := proxy.FromURL(parsed, nil)
+				if derr != nil {
+					log.Warn().Err(derr).Str("proxy", proxyURL).Msg("Failed to build SOCKS proxy dialer, skipping proxy setup")
+				} else {
+					// Apply proxy to both clients now that we know it's valid.
+					httpClient.SetProxy(proxyURL)
+					client.SetSOCKSProxy(dialer, whatsmeow.SetProxyOptions{})
+				}
+			} else {
+				// For http/https, apply to both clients.
+				httpClient.SetProxy(proxyURL)
+				client.SetProxyAddress(parsed.String(), whatsmeow.SetProxyOptions{})
+			}
+		}
+
 	}
 	clientManager.SetHTTPClient(userID, httpClient)
 
@@ -466,6 +489,12 @@ func (s *server) startClient(userID string, textjid string, token string, subscr
 
 				} else if evt.Event == "timeout" {
 					// Clear QR code from DB on timeout
+					// Send webhook notifying QR timeout before cleanup
+					postmap := make(map[string]interface{})
+					postmap["event"] = evt.Event
+					postmap["type"] = "QRTimeout"
+					sendEventWithWebHook(&mycli, postmap, "")
+
 					sqlStmt := `UPDATE users SET qrcode='' WHERE id=$1`
 					_, err := s.db.Exec(sqlStmt, userID)
 					if err != nil {
@@ -1228,7 +1257,13 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		postmap["type"] = "Logged Out"
 		dowebhook = 1
 		log.Info().Str("reason", evt.Reason.String()).Msg("Logged out")
-		killchannel[mycli.userID] <- true
+		defer func() {
+			// Use a non-blocking send to prevent a deadlock if the receiver has already terminated.
+			select {
+			case killchannel[mycli.userID] <- true:
+			default:
+			}
+		}()
 		sqlStmt := `UPDATE users SET connected=0 WHERE id=$1`
 		_, err := mycli.db.Exec(sqlStmt, mycli.userID)
 		if err != nil {
